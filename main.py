@@ -704,6 +704,186 @@ async def health():
     }
 
 
-if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run(app, host="127.0.0.1", port=8005)
+from fastapi import Request
+from fastapi.responses import JSONResponse
+
+@app.get("/.well-known/agent-card.json")
+async def agent_card(request: Request):
+    base_url = str(request.base_url).rstrip("/").replace("http://", "https://")
+    return JSONResponse({
+        "name": "MediTwin Imaging Triage Agent",
+        "description": (
+            "CNN-based chest X-ray triage agent for MediTwin AI (v2.2). Runs a trained "
+            "EfficientNetB0 model (AUC 0.981, Precision 0.976, Recall 0.939) to classify "
+            "chest X-rays as PNEUMONIA or NORMAL, then enriches the result with a structured "
+            "Gemini LLM clinical interpretation acting as a radiologist — producing opinion, "
+            "key concerns, differentials, immediate actions (intelligently merged with CNN "
+            "rule-based actions), follow-up recommendations, and safety-netting. Outputs a "
+            "FHIR DiagnosticReport resource with mandatory AI disclaimer. Only activated by "
+            "the orchestrator when imaging_available=True. Falls back to mock mode if the "
+            "CNN model is not loaded. All results persisted to PostgreSQL."
+        ),
+        "version": "2.2.0",
+        "url": base_url,
+        "provider": {
+            "organization": "MediTwin AI",
+            "name": "Tayyab Hussain",
+            "url": "https://github.com/hssn5667/imaging-triage-agent"
+        },
+        "supportedInterfaces": [
+            {
+                "url": f"{base_url}/analyze-xray",
+                "protocolBinding": "HTTP+JSON",
+                "protocolVersion": "2.2",
+                "description": (
+                    "Blocking X-ray analysis — accepts base64-encoded image, runs CNN inference "
+                    "followed by LLM interpretation, returns full ImagingResponse. Used by the "
+                    "orchestrator programmatically."
+                )
+            },
+            {
+                "url": f"{base_url}/upload-xray",
+                "protocolBinding": "HTTP+multipart",
+                "protocolVersion": "2.2",
+                "description": (
+                    "File upload variant — accepts raw image file (JPEG/PNG) via multipart form "
+                    "without base64 encoding. Intended for Swagger UI and manual testing."
+                )
+            },
+            {
+                "url": f"{base_url}/stream",
+                "protocolBinding": "HTTP+SSE",
+                "protocolVersion": "2.2",
+                "description": (
+                    "SSE streaming X-ray analysis — emits status/progress/token/complete events "
+                    "in real time, including per-token LLM streaming for the interpretation step."
+                )
+            }
+        ],
+        "capabilities": {
+            "streaming": True,
+            "pushNotifications": False,
+            "stateTransitionHistory": True,
+            "cnnInference": True,
+            "llmInterpretation": True,
+            "mockFallback": True,
+            "fhirOutput": True,
+            "fileUpload": True,
+            "actionDeduplication": True,
+            "confidenceAwareInterpretation": True
+        },
+        "defaultInputModes": ["application/json", "multipart/form-data"],
+        "defaultOutputModes": ["application/json", "text/event-stream"],
+        "skills": [
+            {
+                "id": "analyze_xray",
+                "name": "Analyze Chest X-ray (Blocking)",
+                "description": (
+                    "Full pipeline in four steps: (1) base64 decode and validate image (min "
+                    "50x50px); (2) preprocess to 224x224 RGB matching the Kaggle training "
+                    "pipeline (raw [0-255], no /255 normalisation); (3) EfficientNetB0 CNN "
+                    "inference in a thread pool (non-blocking) — produces pneumonia probability, "
+                    "triage severity (P1=IMMEDIATE to P4=ROUTINE), and rule-based imaging "
+                    "findings (pattern, affected area, bilateral, confidence); (4) Gemini LLM "
+                    "interpretation (ImagingLLMInterpretation schema) — clinical opinion, key "
+                    "concern, differential list, immediate actions, follow-up, safety-netting. "
+                    "Actions merged with deduplication: LLM first, then CNN rules, then "
+                    "mandatory safety-netting. Falls back to mock if model not loaded."
+                ),
+                "tags": ["cnn", "efficientnetb0", "chest-xray", "pneumonia", "gemini",
+                         "fhir", "triage", "llm", "radiology"],
+                "inputModes": ["application/json"],
+                "outputModes": ["application/json"]
+            },
+            {
+                "id": "upload_xray",
+                "name": "Upload Chest X-ray (File)",
+                "description": (
+                    "Multipart file upload wrapper around analyze_xray — encodes the uploaded "
+                    "image to base64 internally and delegates to the same CNN+LLM pipeline. "
+                    "Accepts JPEG, PNG, or DICOM-derived images. Intended for Swagger UI and "
+                    "manual clinical testing without needing a base64 encoder."
+                ),
+                "tags": ["file-upload", "multipart", "chest-xray", "swagger"],
+                "inputModes": ["multipart/form-data"],
+                "outputModes": ["application/json"]
+            },
+            {
+                "id": "stream_xray_analysis",
+                "name": "Stream X-ray Analysis (SSE)",
+                "description": (
+                    "SSE streaming variant of analyze_xray. Emits ordered events: status "
+                    "(pipeline step labels), progress (CNN inference and LLM steps), token "
+                    "(per-token LLM output for live UI feedback), and a final complete event "
+                    "containing the full ImagingResponse including FHIR DiagnosticReport."
+                ),
+                "tags": ["sse", "streaming", "chest-xray", "gemini", "real-time", "token-streaming"],
+                "inputModes": ["application/json"],
+                "outputModes": ["text/event-stream"]
+            },
+            {
+                "id": "get_imaging_history",
+                "name": "Get Patient Imaging History",
+                "description": (
+                    "Returns paginated imaging analysis records for a patient from PostgreSQL, "
+                    "newest first. Each record includes prediction, confidence, triage grade, "
+                    "imaging findings, clinical interpretation, LLM enrichment flag, FHIR "
+                    "DiagnosticReport, mock flag, analysis mode (cnn+llm/mock), and source "
+                    "endpoint. Supports limit/offset pagination."
+                ),
+                "tags": ["history", "audit", "patient", "postgresql", "pagination"],
+                "inputModes": ["application/json"],
+                "outputModes": ["application/json"]
+            },
+            {
+                "id": "get_imaging_stats",
+                "name": "Get Patient Imaging Stats",
+                "description": (
+                    "Returns aggregate statistics across all imaging sessions for a patient: "
+                    "total analyses, pneumonia vs normal breakdown, average confidence, "
+                    "triage priority distribution, LLM enrichment rate, mock vs real breakdown, "
+                    "and first/latest session timestamps."
+                ),
+                "tags": ["stats", "analytics", "patient", "postgresql"],
+                "inputModes": ["application/json"],
+                "outputModes": ["application/json"]
+            }
+        ],
+        "imagingConfig": {
+            "cnnModel": {
+                "architecture": "EfficientNetB0",
+                "trainedOn": "Kaggle Chest X-Ray Images (Pneumonia) dataset",
+                "auc": 0.981,
+                "precision": 0.976,
+                "recall": 0.939,
+                "inputSize": "224x224 RGB",
+                "preprocessingNote": "Raw pixel values [0-255] — no /255 normalisation (matches training pipeline)",
+                "pneumoniaThreshold": PNEUMONIA_THRESHOLD,
+                "classes": ["NORMAL", "PNEUMONIA"],
+                "inferenceExecution": "ThreadPoolExecutor (non-blocking, CPU-bound)",
+                "loadStrategy": "Once at startup via lifespan — never per-request"
+            },
+            "llmConfig": {
+                "provider": "Google Gemini",
+                "model": "gemini-2.5-flash-lite",
+                "temperature": 0.1,
+                "invocationPattern": "LangChain with_structured_output(ImagingLLMInterpretation)",
+                "streamingPattern": "astream_events v2 (on_chat_model_stream)",
+                "outputSchema": "ImagingLLMInterpretation (Pydantic v2)",
+                "systemRole": "Radiologist + clinical decision support",
+                "fallbackMode": "CNN rule-based interpretation only (no LLM narrative)"
+            },
+            "triagePriorities": {
+                "P1": "IMMEDIATE — High-confidence pneumonia, elderly or paediatric patient",
+                "P2": "URGENT — High-confidence pneumonia, adult patient",
+                "P3": "SEMI-URGENT — Moderate-confidence or borderline finding",
+                "P4": "ROUTINE — Normal or low-suspicion finding"
+            },
+            "analysisModes": {
+                "cnn+llm": "Image provided + model loaded — CNN inference then LLM interpretation",
+                "mock": "Image provided but model not loaded — deterministic mock output"
+            },
+            "orchestratorRouting": "Only activated when imaging_available=True in PatientState"
+        }
+    })
+
